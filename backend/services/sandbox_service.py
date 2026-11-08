@@ -1,0 +1,1375 @@
+"""AxiomTrace sandbox execution domain service.
+
+Runs node source code inside a hardened, isolated runtime and optionally
+stress-tests it against an edge-case corpus.
+
+Isolation model
+---------------
+* A curated builtin whitelist replaces ``__builtins__`` - file, process,
+  network and reflection escape hatches (``open``, ``eval``, ``exec``,
+  ``os``, ``__import__`` ...) are removed.
+* Imports raise a descriptive :class:`SandboxImportError` instead of
+  loading modules.
+* The node runs in a **separate worker process** (``forkserver`` on POSIX,
+  ``spawn`` on Windows). A wall-clock watchdog terminates the worker, so a
+  runaway loop is genuinely killed instead of being merely reported while it
+  keeps burning CPU in the background.
+* A bytecode instruction budget stops tight loops long before the wall
+  clock trips.
+* An optional address-space rlimit (512 MiB) keeps a single node from
+  ballooning the host.
+* Every platform quirk is guarded: when a worker process cannot be
+  spawned the service transparently degrades to an in-process thread
+  watchdog, so the feature never disappears.
+
+The sandbox is a *local developer sandbox*, not a defence against hostile
+code - it exists to keep honest experimentation fast, bounded and legible.
+"""
+
+from __future__ import annotations
+
+import builtins as _builtins
+import inspect
+import io
+import json
+import math
+import multiprocessing
+import os
+import sys
+import threading
+import time
+import traceback
+from pathlib import Path
+from typing import Any, Callable
+
+from config import config
+from services.node_source import (
+    build_fallback_source,
+    is_python_language,
+    language_for_path,
+    normalise_language,
+    resolve_node_source,
+)
+
+# ----------------------------------------------------------------------
+# Safe builtin surface
+# ----------------------------------------------------------------------
+
+SAFE_BUILTIN_NAMES: tuple[str, ...] = (
+    "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes",
+    "callable", "chr", "classmethod", "complex", "divmod", "enumerate",
+    "filter", "float", "format", "frozenset", "hash", "hex", "id", "int",
+    "isinstance", "issubclass", "iter", "len", "list", "map", "max", "min",
+    "next", "object", "oct", "ord", "pow", "print", "range", "repr",
+    "reversed", "round", "set", "slice", "sorted", "staticmethod", "str",
+    "sum", "super", "tuple", "type", "zip",
+    # exceptions
+    "ArithmeticError", "AssertionError", "AttributeError", "BaseException",
+    "Exception", "IndexError", "KeyError", "LookupError", "NameError",
+    "NotImplementedError", "OverflowError", "RuntimeError", "StopIteration",
+    "TypeError", "ValueError", "ZeroDivisionError", "TimeoutError",
+    "UserWarning", "Warning",
+)
+
+ENTRY_FUNCTION_NAMES: tuple[str, ...] = (
+    "main", "run", "execute", "solve", "process", "handler",
+    "compute", "transform", "evaluate",
+)
+
+# Variables always injected into the isolated scope.
+SCOPE_INJECTION_NAMES: tuple[str, ...] = (
+    "input_data", "input", "payload", "params", "args", "kwargs",
+)
+
+INSTRUCTION_BUDGET = 10_000_000
+SANDBOX_TIMEOUT_SECONDS = 2.0
+MAX_STDOUT_BYTES = 10240
+MAX_STDERR_BYTES = 10240
+try:
+    _THIS_FILE = os.path.abspath(__file__)
+except Exception:  # noqa: BLE001
+    _THIS_FILE = ""
+
+
+MAX_TRACE_FRAMES = 12
+_BLOCKED_IMPORT_NAMES = {"os", "sys", "subprocess", "shutil", "socket", "ctypes", "pathlib", "importlib", "pickle", "marshal"}
+BLOCKED_BUILTINS = {"__import__", "eval", "exec", "compile", "open", "file", "input", "raw_input", "reload", "vars", "dir", "globals", "locals"}
+DANGEROUS_MODULES = {"os", "sys", "subprocess", "shutil", "socket", "ctypes", "imp", "importlib", "pathlib", "pty", "fcntl", "signal", "resource", "pickle", "marshal", "code", "codeop", "builtins", "__builtin__"}
+
+class SandboxTimeoutError(RuntimeError):
+    """Raised when a node exceeds its wall-clock budget."""
+
+
+class SandboxBudgetExceeded(RuntimeError):
+    """Raised when a node exceeds its bytecode instruction budget."""
+
+
+class SandboxImportError(RuntimeError):
+    """Raised when sandboxed code attempts to import a module."""
+
+
+# ----------------------------------------------------------------------
+# Safe builtins
+# ----------------------------------------------------------------------
+
+def _blocked_import(*_args: Any, **_kwargs: Any) -> Any:
+    raise SandboxImportError(
+        "import is disabled inside the AxiomTrace sandbox - paste the "
+        "helpers you need directly into the node."
+    )
+
+
+def build_safe_builtins() -> dict[str, Any]:
+    """Materialise the restricted builtin namespace."""
+    safe: dict[str, Any] = {}
+    for name in SAFE_BUILTIN_NAMES:
+        attribute = getattr(_builtins, name, None)
+        if attribute is not None:
+            safe[name] = attribute
+    safe["__import__"] = _blocked_import
+    safe["__build_class__"] = _builtins.__build_class__
+    safe["__name__"] = "axiom_sandbox"
+    safe["__doc__"] = None
+    return safe
+
+
+SAFE_BUILTINS: dict[str, Any] = build_safe_builtins()
+
+
+# ----------------------------------------------------------------------
+# JSON helpers
+# ----------------------------------------------------------------------
+
+def json_safe(value: Any, depth: int = 0, max_depth: int = 6) -> Any:
+    """Coerce arbitrary runtime values into strictly JSON-serialisable data.
+
+    Non-finite floats are converted to their string spelling (``"NaN"``,
+    ``"Infinity"``) because ``NaN``/``Infinity`` are *not* valid JSON and
+    would break ``JSON.parse`` on the client. The same applies to
+    ``complex`` numbers and any exotic object.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0 else "-Infinity"
+        return value
+    if isinstance(value, str):
+        if len(value) > 8000:
+            return value[:8000] + "\u2026 [truncated]"
+        return value
+    if depth >= max_depth:
+        return _safe_repr(value)
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item, depth + 1, max_depth) for item in value[:200]]
+    if isinstance(value, (set, frozenset)):
+        return [_safe_repr(item) for item in list(value)[:200]]
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= 200:
+                out["__truncated__"] = f"+{len(value) - 200} keys"
+                break
+            out[str(key)] = json_safe(item, depth + 1, max_depth)
+        return out
+    if isinstance(value, (bytes, bytearray)):
+        return {"__bytes__": len(value), "preview": value[:64].decode("utf-8", "replace")}
+    if isinstance(value, complex):
+        return {"__complex__": [value.real, value.imag]}
+    return _safe_repr(value)
+
+
+def _safe_repr(value: Any) -> str:
+    try:
+        text = repr(value)
+    except Exception:
+        try:
+            text = f"<unreprable {type(value).__name__}>"
+        except Exception:
+            text = "<unreprable>"
+    if len(text) > 800:
+        return text[:800] + "\u2026"
+    return text
+
+
+def _safe_str(value: Any) -> str:
+    try:
+        return str(value)
+    except Exception:
+        return "<unprintable>"
+
+
+def _make_print(stream: io.StringIO) -> Callable[..., None]:
+    """Build a ``print`` replacement bound to this sandbox's stdout buffer.
+
+    ``contextlib.redirect_stdout`` mutates the process-global ``sys.stdout``
+    which would swallow every other thread's output (Flask logs, health
+    checks...). Injecting the print builtin keeps capture thread-local.
+    """
+
+    def _print(*args: Any, sep: str = " ", end: str = "\n", flush: bool = False) -> None:
+        try:
+            stream.write(sep.join(_safe_str(arg) for arg in args) + end)
+            if flush:
+                stream.flush()
+        except Exception:
+            pass
+        return None
+
+    return _print
+
+
+# ----------------------------------------------------------------------
+# Human readable tracebacks
+# ----------------------------------------------------------------------
+
+def _is_internal_frame(filename: str) -> bool:
+    """True when a frame belongs to the sandbox machinery itself."""
+    if not filename:
+        return False
+    if filename.startswith("<"):
+        return False
+    try:
+        return os.path.abspath(filename) == _THIS_FILE
+    except (OSError, ValueError):
+        return False
+
+
+def format_traceback(
+    error: BaseException,
+    source: str | None = None,
+    max_frames: int = MAX_TRACE_FRAMES,
+) -> str:
+    """Render an exception as a compact, developer readable trace.
+
+    Internal sandbox frames are removed, the offending source line is
+    inlined when it is known, and the frame list is capped so a deep
+    recursion never floods the inspector.
+    """
+    try:
+        rendered = traceback.TracebackException.from_exception(error, compact=True)
+    except Exception:  # noqa: BLE001 - formatting must never raise
+        return "".join(traceback.format_exception_only(type(error), error)).strip()
+
+    source_lines = source.splitlines() if isinstance(source, str) else []
+
+    frames = [frame for frame in rendered.stack if not _is_internal_frame(frame.filename)]
+    if len(frames) > max_frames:
+        hidden = len(frames) - max_frames
+        frames = frames[-max_frames:]
+    else:
+        hidden = 0
+
+    lines: list[str] = []
+    if hidden > 0:
+        lines.append(f"  ... {hidden} earlier frame(s) elided ...")
+
+    for frame in frames:
+        lines.append(
+            f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}'
+        )
+        code_line = frame.line
+        if not code_line and source_lines:
+            index = int(frame.lineno or 0) - 1
+            if 0 <= index < len(source_lines):
+                code_line = source_lines[index]
+        if code_line:
+            lines.append(f"    {str(code_line).strip()}")
+
+    try:
+        lines.extend(rendered.format_exception_only())
+    except Exception:  # noqa: BLE001
+        lines.append(f"{type(error).__name__}: {error}")
+
+    return "\n".join(line for line in lines if line is not None).strip()
+
+
+def _extract_error_line(error: BaseException) -> int | None:
+    tb = error.__traceback__
+    user_line = None
+    fallback = None
+    while tb is not None:
+        fallback = tb
+        if not _is_internal_frame(tb.tb_frame.f_code.co_filename):
+            user_line = tb.tb_lineno
+        tb = tb.tb_next
+    if user_line is not None:
+        return user_line
+    return fallback.tb_lineno if fallback is not None else None
+
+
+# ----------------------------------------------------------------------
+# Entry-point invocation
+# ----------------------------------------------------------------------
+
+def _invoke_entry(callable_obj: Callable[..., Any], payload: Any) -> Any:
+    """Call a discovered entry function with the mocked input payload."""
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return callable_obj(payload)
+
+    parameters = [
+        parameter
+        for name, parameter in signature.parameters.items()
+        if name not in {"self", "cls"}
+    ]
+    has_var_positional = any(
+        p.kind == inspect.Parameter.VAR_POSITIONAL for p in parameters
+    )
+    has_var_keyword = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters
+    )
+    positional = [
+        p for p in parameters if p.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    keyword_only = [
+        p for p in parameters
+        if p.kind == inspect.Parameter.KEYWORD_ONLY and p.default is inspect.Parameter.empty
+    ]
+
+    if not parameters:
+        return callable_obj()
+
+    if isinstance(payload, dict):
+        if len(positional) == 1 and not keyword_only and positional[0].name not in payload:
+            # Single-arg entry points (e.g. `def main(user)`) receive the most
+            # likely intended mock value rather than the whole envelope.
+            mock_value = payload.get(
+                "value", payload.get("input", payload.get("data", payload))
+            )
+            return callable_obj(mock_value)
+
+        kwargs: dict[str, Any] = {}
+        for parameter in positional + keyword_only:
+            if parameter.name in payload:
+                kwargs[parameter.name] = payload[parameter.name]
+            elif parameter.default is inspect.Parameter.empty and not has_var_keyword:
+                raise TypeError(
+                    f"Mock input is missing required parameter '{parameter.name}'."
+                )
+        if has_var_keyword:
+            for key, value in payload.items():
+                if key not in kwargs:
+                    kwargs[key] = value
+        return callable_obj(**kwargs)
+
+    if isinstance(payload, (list, tuple)):
+        if has_var_positional:
+            return callable_obj(*payload)
+        if len(positional) == 1:
+            return callable_obj(payload)
+        return callable_obj(*payload)
+
+    if len(positional) == 1 and not keyword_only:
+        parameter = positional[0]
+        if parameter.default is inspect.Parameter.empty or parameter.kind != inspect.Parameter.KEYWORD_ONLY:
+            return callable_obj(payload)
+
+    return callable_obj(payload)
+
+
+# ----------------------------------------------------------------------
+# Core execution (runs inside the worker)
+# ----------------------------------------------------------------------
+
+def _find_entry(namespace: dict[str, Any]) -> tuple[Callable[..., Any] | None, str | None]:
+    """Locate the callable a node should be invoked through.
+
+    Preference order:
+
+    1. Conventional entry names (``main``, ``run``, ``solve`` ...).
+    2. The most recently defined user function in the snippet - parsed AST
+       nodes rarely use conventional names, so ``def score(user)`` must
+       still be executable with mocked input.
+    3. A module-level ``result``/``output``/``value`` binding.
+    """
+    for name in ENTRY_FUNCTION_NAMES:
+        candidate = namespace.get(name)
+        if callable(candidate) and not inspect.isclass(candidate):
+            return candidate, name
+
+    user_functions: list[tuple[str, Callable[..., Any]]] = []
+    for name, candidate in namespace.items():
+        if name.startswith("_") or name in SCOPE_INJECTION_NAMES:
+            continue
+        if not inspect.isfunction(candidate):
+            continue
+        if getattr(candidate, "__globals__", None) is not namespace:
+            continue
+        user_functions.append((name, candidate))
+
+    if user_functions:
+        name, function = user_functions[-1]
+        return function, name
+
+    return None, None
+
+
+def _install_instruction_guard(limit: int) -> Callable[..., Any]:
+    counter = {"instructions": 0}
+
+    def _trace(frame: Any, event: str, arg: Any) -> Any:
+        counter["instructions"] += 1
+        if counter["instructions"] > limit:
+            raise SandboxBudgetExceeded(
+                f"Execution aborted after {limit:,} bytecode instructions."
+            )
+        return _trace
+
+    sys.settrace(_trace)
+    return _trace
+
+
+def _remove_instruction_guard() -> None:
+    try:
+        sys.settrace(None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _empty_result(input_data: Any) -> dict[str, Any]:
+    return {
+        "status": "success",
+        "stdout": "",
+        "stdout_truncated": False,
+        "return_value": None,
+        "return_repr": "None",
+        "execution_time": 0.0,
+        "entry_function": None,
+        "input_data": json_safe(input_data),
+        "error": None,
+    }
+
+
+def _run_core(code_str: str, input_data: Any, max_output: int, max_trace: int) -> dict[str, Any]:
+    """Execute code inside the restricted scope. Never raises."""
+    started = time.perf_counter()
+    stdout_buffer = io.StringIO()
+    sandbox_builtins = build_safe_builtins()
+    sandbox_builtins["print"] = _make_print(stdout_buffer)
+    max_output = int(max_output) if max_output is not None else MAX_STDOUT_BYTES
+    max_trace = int(max_trace) if max_trace is not None else MAX_TRACE_FRAMES
+
+    try:
+        try:
+            _install_instruction_guard(int(getattr(config, "SANDBOX_MAX_INSTRUCTIONS", 10_000_000)))
+        except Exception:
+            pass
+
+        namespace: dict[str, Any] = {}
+        namespace["__name__"] = "__main__"
+        namespace["__builtins__"] = sandbox_builtins
+        namespace["input_data"] = json_safe(input_data)
+        namespace["input"] = namespace["input_data"]
+        namespace["payload"] = namespace["input_data"]
+
+        try:
+            compiled = compile(code_str, "<axiom-node>", "exec")
+        except SyntaxError as error:
+            elapsed = time.perf_counter() - started
+            out = stdout_buffer.getvalue()
+            return {
+                "status": "error",
+                "stdout": out[:max_output],
+                "stdout_truncated": len(out) > max_output,
+                "stderr": "",
+                "stderr_truncated": False,
+                "return_value": None,
+                "return_repr": "None",
+                "execution_time": round(elapsed * 1000, 3),
+                "entry_function": None,
+                "input_data": json_safe(input_data),
+                "error": {
+                    "type": "SyntaxError",
+                    "message": str(error),
+                    "traceback": format_traceback(error, source=code_str, max_frames=max_trace),
+                    "line": getattr(error, "lineno", None),
+                },
+            }
+
+        try:
+            exec(compiled, namespace, namespace)
+        except SandboxImportError as error:
+            elapsed = time.perf_counter() - started
+            out = stdout_buffer.getvalue()
+            return {
+                "status": "error",
+                "stdout": out[:max_output],
+                "stdout_truncated": len(out) > max_output,
+                "stderr": "",
+                "stderr_truncated": False,
+                "return_value": None,
+                "return_repr": "None",
+                "execution_time": round(elapsed * 1000, 3),
+                "entry_function": None,
+                "input_data": json_safe(input_data),
+                "error": {
+                    "type": "SandboxImportError",
+                    "message": str(error),
+                    "traceback": format_traceback(error, source=code_str, max_frames=max_trace),
+                    "line": _extract_error_line(error),
+                },
+            }
+        except Exception as error:  # noqa: BLE001
+            elapsed = time.perf_counter() - started
+            out = stdout_buffer.getvalue()
+            status = "timeout" if isinstance(error, SandboxTimeoutError) else "error"
+            return {
+                "status": status,
+                "stdout": out[:max_output],
+                "stdout_truncated": len(out) > max_output,
+                "stderr": "",
+                "stderr_truncated": False,
+                "return_value": None,
+                "return_repr": "None",
+                "execution_time": round(elapsed * 1000, 3),
+                "entry_function": None,
+                "input_data": json_safe(input_data),
+                "error": {
+                    "type": (
+                        "SandboxTimeout"
+                        if isinstance(error, SandboxTimeoutError)
+                        else type(error).__name__
+                    ),
+                    "message": str(error),
+                    "traceback": format_traceback(error, source=code_str, max_frames=max_trace),
+                    "line": _extract_error_line(error),
+                },
+            }
+
+        entry, entry_name = _find_entry(namespace)
+        if entry is not None:
+            try:
+                result = _invoke_entry(entry, namespace.get("input_data"))
+                elapsed = time.perf_counter() - started
+                out = stdout_buffer.getvalue()
+                return {
+                    "status": "success",
+                    "stdout": out[:max_output],
+                    "stdout_truncated": len(out) > max_output,
+                    "stderr": "",
+                    "stderr_truncated": False,
+                    "return_value": json_safe(result),
+                    "return_repr": _safe_repr(result),
+                    "execution_time": round(elapsed * 1000, 3),
+                    "entry_function": entry_name,
+                    "input_data": json_safe(input_data),
+                    "error": None,
+                }
+            except Exception as error:  # noqa: BLE001
+                elapsed = time.perf_counter() - started
+                out = stdout_buffer.getvalue()
+                return {
+                    "status": "error",
+                    "stdout": out[:max_output],
+                    "stdout_truncated": len(out) > max_output,
+                    "stderr": "",
+                    "stderr_truncated": False,
+                    "return_value": None,
+                    "return_repr": "None",
+                    "execution_time": round(elapsed * 1000, 3),
+                    "entry_function": entry_name,
+                    "input_data": json_safe(input_data),
+                    "error": {
+                        "type": type(error).__name__,
+                        "message": str(error),
+                        "traceback": format_traceback(error, source=code_str, max_frames=max_trace),
+                        "line": _extract_error_line(error),
+                    },
+                }
+
+        module_result = namespace.get("result")
+        if module_result is None:
+            for key in ("output", "value", "answer", "return_value"):
+                if key in namespace:
+                    module_result = namespace[key]
+                    break
+
+        elapsed = time.perf_counter() - started
+        out = stdout_buffer.getvalue()
+        return {
+            "status": "success",
+            "stdout": out[:max_output],
+            "stdout_truncated": len(out) > max_output,
+            "stderr": "",
+            "stderr_truncated": False,
+            "return_value": json_safe(module_result),
+            "return_repr": _safe_repr(module_result),
+            "execution_time": round(elapsed * 1000, 3),
+            "entry_function": None,
+            "input_data": json_safe(input_data),
+            "error": None,
+        }
+    finally:
+        try:
+            _remove_instruction_guard()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# ----------------------------------------------------------------------
+# Worker process plumbing
+# ----------------------------------------------------------------------
+
+_ISOLATION_CONTEXT: Any = None
+_ISOLATION_RESOLVED = False
+_ISOLATION_LOCK = threading.Lock()
+
+
+def _ensure_backend_importable() -> None:
+    """Make sure ``services.sandbox_service`` is importable in a child."""
+    backend_dir = str(Path(__file__).resolve().parent.parent)
+    if backend_dir not in sys.path:
+        sys.path.insert(0, backend_dir)
+
+
+def resolve_isolation_context() -> Any:
+    """Resolve the multiprocessing context used to sandbox a node.
+
+    Returns ``None`` when the platform forbids spawning a worker, in which
+    case the caller degrades to the in-process thread watchdog.
+
+    ``fork`` is preferred on POSIX because the child is a copy-on-write
+    clone of the parent: it needs no re-import and costs ~1 ms, which keeps
+    a 54-run mutation sweep snappy. ``forkserver``/``spawn`` re-execute the
+    ``__main__`` module in every worker (re-importing Flask, SQLAlchemy and
+    friends), which is far too slow for a hot path.
+
+    Forking from a threaded server is safe here because the worker only
+    executes code that cannot import anything (``__import__`` is replaced
+    by a raising stub) - the only module the worker touches is ``resource``,
+    which is pre-imported in the parent so the child never has to take the
+    import lock.
+    """
+    global _ISOLATION_CONTEXT, _ISOLATION_RESOLVED
+
+    with _ISOLATION_LOCK:
+        if _ISOLATION_RESOLVED:
+            return _ISOLATION_CONTEXT
+
+        _ISOLATION_RESOLVED = True
+        mode = str(getattr(config, "SANDBOX_ISOLATION", "auto") or "auto").lower()
+
+        if mode == "thread":
+            _ISOLATION_CONTEXT = None
+            return None
+
+        _ensure_backend_importable()
+        _preload_worker_modules()
+
+        try:
+            if hasattr(os, "fork"):
+                _ISOLATION_CONTEXT = multiprocessing.get_context("fork")
+            else:  # pragma: no cover - Windows
+                _ISOLATION_CONTEXT = multiprocessing.get_context("spawn")
+        except (ValueError, OSError, AttributeError):
+            _ISOLATION_CONTEXT = None
+
+        return _ISOLATION_CONTEXT
+
+
+def _preload_worker_modules() -> None:
+    """Import the modules a worker may need *before* the fork.
+
+    After ``fork`` the child inherits ``sys.modules``; anything already
+    present is resolved without touching the import lock, which removes the
+    only realistic deadlock hazard of forking a threaded server.
+    """
+    for name in ("resource", "traceback", "json", "math", "time", "io", "sys"):
+        try:
+            __import__(name)
+        except Exception:  # noqa: BLE001 - best effort warm-up
+            continue
+
+
+def describe_isolation() -> dict[str, Any]:
+    """Expose the active isolation strategy for diagnostics."""
+    context = resolve_isolation_context()
+    strategy = "thread" if context is None else getattr(context, "get_start_method", lambda: "unknown")()
+    return {
+        "strategy": strategy,
+        "timeout_seconds": float(config.SANDBOX_TIMEOUT_SECONDS),
+        "mutation_timeout_seconds": float(config.MUTATION_TIMEOUT_SECONDS),
+        "mutation_budget_seconds": float(config.MUTATION_TOTAL_BUDGET_SECONDS),
+        "instruction_budget": int(config.SANDBOX_MAX_INSTRUCTIONS),
+        "memory_limit_mb": int(config.SANDBOX_MEMORY_LIMIT_MB),
+        "edge_case_count": len(config.MUTATION_EDGE_INPUTS),
+    }
+
+
+def _apply_memory_limit() -> None:
+    """Cap the address space of the worker process (POSIX only)."""
+    limit_mb = int(getattr(config, "SANDBOX_MEMORY_LIMIT_MB", 0) or 0)
+    if limit_mb <= 0:
+        return
+    try:
+        import resource
+    except ImportError:  # pragma: no cover - Windows
+        return
+    try:
+        limit = limit_mb * 1024 * 1024
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        ceiling = limit if hard == resource.RLIM_INFINITY else min(limit, hard)
+        resource.setrlimit(resource.RLIMIT_AS, (ceiling, hard))
+    except (ValueError, OSError):  # pragma: no cover - platform dependent
+        pass
+
+
+def _sandbox_worker(
+    connection: Any,
+    code_str: str,
+    input_data: Any,
+    max_output: int,
+    max_trace: int,
+) -> None:
+    """Child-process entrypoint. Sends exactly one report through the pipe."""
+    try:
+        _apply_memory_limit()
+        report = _run_core(code_str, input_data, max_output, max_trace)
+    except BaseException as error:  # noqa: BLE001 - last resort guard
+        report = _empty_result(input_data)
+        report["status"] = "error"
+        report["error"] = {
+            "type": type(error).__name__,
+            "message": str(error),
+            "traceback": format_traceback(error, source=code_str, max_frames=max_trace),
+            "line": None,
+        }
+    try:
+        connection.send(report)
+    except Exception:  # noqa: BLE001 - the parent may have vanished
+        pass
+    finally:
+        try:
+            connection.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _safe_close(handle: Any) -> None:
+    try:
+        if handle is not None:
+            handle.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _terminate_process(process: Any) -> None:
+    """Hard-kill a worker that blew its wall-clock budget."""
+    try:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=0.75)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=0.75)
+    except Exception:  # noqa: BLE001 - termination must never raise
+        pass
+
+
+def _run_isolated(
+    code_str: str,
+    input_data: Any,
+    timeout: float,
+    max_output: int,
+    max_trace: int,
+) -> tuple[str, dict[str, Any] | None]:
+    """Execute a node inside a worker process.
+
+    Returns ``(status, report)`` where ``status`` is one of:
+
+    ``ok``
+        The worker produced a report.
+    ``timeout``
+        The worker exceeded its budget and was terminated.
+    ``crashed``
+        The worker died without producing a report.
+    ``unavailable``
+        A worker could not be spawned - the caller should fall back.
+    """
+    context = resolve_isolation_context()
+    if context is None:
+        return "unavailable", None
+
+    try:
+        read_conn, write_conn = context.Pipe(duplex=False)
+    except Exception:  # noqa: BLE001
+        return "unavailable", None
+
+    try:
+        process = context.Process(
+            target=_sandbox_worker,
+            args=(write_conn, code_str, input_data, max_output, max_trace),
+            daemon=True,
+        )
+        process.start()
+    except Exception:  # noqa: BLE001 - unpicklable payload, no fork, ...
+        _safe_close(write_conn)
+        _safe_close(read_conn)
+        return "unavailable", None
+
+    # The parent must drop its copy of the write end, otherwise the reader
+    # never observes EOF when the child dies.
+    _safe_close(write_conn)
+
+    deadline = time.monotonic() + max(0.05, float(timeout))
+    payload: dict[str, Any] | None = None
+    timed_out = False
+
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            if read_conn.poll(min(0.02, remaining)):
+                try:
+                    payload = read_conn.recv()
+                except (EOFError, OSError):
+                    payload = None
+                break
+            if not process.is_alive():
+                # The child exited - give the pipe a last chance to flush.
+                try:
+                    if read_conn.poll(0.05):
+                        payload = read_conn.recv()
+                except (EOFError, OSError):
+                    payload = None
+                break
+    finally:
+        if timed_out:
+            _terminate_process(process)
+        else:
+            try:
+                process.join(timeout=1.0)
+            except Exception:  # noqa: BLE001
+                pass
+        _safe_close(read_conn)
+
+    if timed_out:
+        return "timeout", None
+    if payload is None:
+        return "crashed", None
+    return "ok", payload
+
+
+def _run_threaded(
+    code_str: str,
+    input_data: Any,
+    timeout: float,
+    max_output: int,
+    max_trace: int,
+) -> tuple[str, dict[str, Any] | None]:
+    """In-process fallback used when a worker process is unavailable."""
+    holder: dict[str, Any] = {}
+    finished = threading.Event()
+
+    def _target() -> None:
+        try:
+            holder["result"] = _run_core(
+                code_str,
+                input_data,
+                max_output,
+                max_trace,
+            )
+        except BaseException as error:  # noqa: BLE001 - last resort guard
+            report = _empty_result(input_data)
+            report["status"] = "error"
+            report["error"] = {
+                "type": type(error).__name__,
+                "message": str(error),
+                "traceback": format_traceback(error, source=code_str, max_frames=max_trace),
+                "line": None,
+            }
+            holder["result"] = report
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=_target, name="axiom-sandbox", daemon=True)
+    worker.start()
+    finished.wait(timeout)
+
+    if not finished.is_set():
+        return "timeout", None
+
+    return "ok", holder.get("result")
+
+
+# ----------------------------------------------------------------------
+# Public API
+# ----------------------------------------------------------------------
+
+def _error_report(
+    error_type: str,
+    message: str,
+    input_data: Any,
+    execution_time: float = 0.0,
+    traceback_text: str = "",
+    line: int | None = None,
+) -> dict[str, Any]:
+    report = _empty_result(input_data)
+    report["status"] = "error"
+    report["execution_time"] = round(float(execution_time), 3)
+    report["error"] = {
+        "type": error_type,
+        "message": message,
+        "traceback": traceback_text,
+        "line": line,
+    }
+    return report
+
+
+def _timeout_report(input_data: Any, budget: float) -> dict[str, Any]:
+    report = _empty_result(input_data)
+    report["status"] = "timeout"
+    report["execution_time"] = round(budget * 1000, 3)
+    report["error"] = {
+        "type": "SandboxTimeout",
+        "message": (
+            f"Execution exceeded the {budget:.1f}s budget and was aborted."
+        ),
+        "traceback": "",
+        "line": None,
+    }
+    return report
+
+
+def _prepare_execution_source(
+    code_str: Any,
+    *,
+    label: str | None = None,
+    file_path: str | None = None,
+    module: str | None = None,
+    fallback_code: str | None = None,
+    language: str | None = None,
+) -> tuple[str, str, str, str | None, str | None]:
+    """Resolve source the Python-only sandbox runner may actually execute.
+
+    Two gates run after :func:`resolve_node_source` has produced text:
+
+    1. **Language gate** - the runner is a Python ``exec`` loop, so a node
+       declaring any other language (``java``, ``javascript``, ...) is never
+       fed to it: the safe stub is substituted (origin ``language-fallback``)
+       with a human readable warning.
+    2. **Syntax gate** - Python text that fails ``compile()`` (bound or an
+       explicit snippet) is likewise replaced by the safe stub (origin
+       ``syntax-fallback``) and the original error is preserved so the
+       inspector can still report *why* the real source could not run.
+
+    Returns ``(source, source_origin, language, warning, original_error)``.
+    """
+    declared = normalise_language(language) or normalise_language(language_for_path(file_path))
+    source, source_origin = resolve_node_source(
+        code_str,
+        label=label,
+        file_path=file_path,
+        module=module,
+        fallback=fallback_code,
+        language=declared or None,
+    )
+    resolved_language = declared or normalise_language(language_for_path(file_path)) or "python"
+
+    # Gate 1: never hand non-Python source to the Python exec loop.
+    if source_origin != "generated" and not is_python_language(declared):
+        warning = (
+            f"Node declares language '{resolved_language}' but the sandbox runs Python only - "
+            "executed the safe fallback stub instead."
+        )
+        stub = build_fallback_source(
+            label=label,
+            file_path=file_path,
+            module=module,
+            language=resolved_language,
+        )
+        return stub, "language-fallback", resolved_language, warning, None
+
+    # Gate 2: Python source must at least compile before it reaches exec.
+    try:
+        compile(source, "<axiomtrace-node>", "exec")
+    except (SyntaxError, ValueError, TypeError, RecursionError) as error:
+        original_error = f"{type(error).__name__}: {error}"
+        warning = (
+            "Bound source failed to compile - "
+            f"{original_error}; executed the safe fallback stub instead."
+        )
+        stub = build_fallback_source(
+            label=label,
+            file_path=file_path,
+            module=module,
+            language=resolved_language,
+        )
+        return stub, "syntax-fallback", resolved_language, warning, original_error
+
+    return source, source_origin, resolved_language, None, None
+
+
+def execute_node_code(
+    code_str: Any,
+    input_data: Any = None,
+    timeout: float | None = None,
+    *,
+    label: str | None = None,
+    file_path: str | None = None,
+    module: str | None = None,
+    fallback_code: str | None = None,
+    language: str | None = None,
+) -> dict[str, Any]:
+    """Execute a node's source with mocked input inside the sandbox.
+
+    Missing or empty source never fails the request: :func:`resolve_node_source`
+    falls back to an explicit snippet, then to a generated stand-in derived
+    from the node label / file path / module, so the sandbox always has
+    something executable to run. Non-Python declarations and Python source
+    that does not compile are swapped for the same safe stub by
+    :func:`_prepare_execution_source`, so neither ``ValueError: Node source
+    is empty`` nor ``SyntaxError: Invalid syntax`` can escape as a 500.
+
+    Returns a structured report::
+
+        {
+          "status": "success" | "error" | "timeout",
+          "stdout": str,
+          "return_value": Any,
+          "execution_time": float,   # milliseconds
+          "source_origin": "bound" | "explicit-fallback" | "generated"
+                          | "language-fallback" | "syntax-fallback",
+          "language": str,
+          "warning": str | None,
+          "original_error": str | None,
+          "error": {...} | None
+        }
+    """
+    source, source_origin, resolved_language, warning, original_error = (
+        _prepare_execution_source(
+            code_str,
+            label=label,
+            file_path=file_path,
+            module=module,
+            fallback_code=fallback_code,
+            language=language,
+        )
+    )
+
+    def annotate(result: dict[str, Any]) -> dict[str, Any]:
+        result["source_origin"] = source_origin
+        result["language"] = resolved_language
+        result["warning"] = warning
+        result["original_error"] = original_error
+        return result
+
+    budget = float(timeout or config.SANDBOX_TIMEOUT_SECONDS)
+    max_output = int(config.SANDBOX_MAX_OUTPUT_CHARS)
+    max_trace = int(config.SANDBOX_MAX_TRACEBACK_LINES)
+
+    status, report = _run_isolated(source, input_data, budget, max_output, max_trace)
+
+    if status == "unavailable":
+        status, report = _run_threaded(source, input_data, budget, max_output, max_trace)
+
+    if status == "timeout":
+        return annotate(_timeout_report(input_data, budget))
+
+    if status == "crashed":
+        return annotate(
+            _error_report(
+                "SandboxCrash",
+                "The sandbox worker exited unexpectedly (likely out of memory).",
+                input_data,
+            )
+        )
+
+    if report is None:  # pragma: no cover - defensive
+        return annotate(
+            _error_report(
+                "RuntimeError",
+                "Sandbox worker produced no result.",
+                input_data,
+            )
+        )
+
+    return annotate(report)
+
+
+# ----------------------------------------------------------------------
+# Mutation stress testing
+# ----------------------------------------------------------------------
+
+def mutation_payload(edge_input: Any) -> dict[str, Any]:
+    """Build the mock input envelope handed to a node under stress."""
+    return {
+        "value": edge_input,
+        "input": edge_input,
+        "data": edge_input,
+        "items": edge_input,
+        "payload": edge_input,
+        "records": edge_input,
+        "row": edge_input,
+        "n": edge_input,
+        "count": edge_input,
+        "args": [edge_input],
+        "params": {"value": edge_input},
+    }
+
+
+def _edge_case_label(edge_input: Any) -> str:
+    """Readable label for an edge-case input (``NaN``, ``'text'``, ...)."""
+    if edge_input is None:
+        return "None"
+    if isinstance(edge_input, bool):
+        return str(edge_input)
+    if isinstance(edge_input, float):
+        if math.isnan(edge_input):
+            return "float('nan')"
+        if math.isinf(edge_input):
+            return "float('inf')" if edge_input > 0 else "float('-inf')"
+        return repr(edge_input)
+    if isinstance(edge_input, str):
+        return repr(edge_input)
+    if isinstance(edge_input, (list, dict, tuple, set)):
+        return type(edge_input).__name__ + f"({len(edge_input)})"
+    return repr(edge_input)
+
+
+def run_mutation_stress_test(
+    code_str: Any,
+    iterations: int = 1,
+    timeout: float | None = None,
+    edge_inputs: list[Any] | None = None,
+    *,
+    label: str | None = None,
+    file_path: str | None = None,
+    module: str | None = None,
+    fallback_code: str | None = None,
+    language: str | None = None,
+) -> dict[str, Any]:
+    """Replay a node against the edge-case corpus and aggregate failures.
+
+    Returns crash frequency, per-case results, unique stack traces and a
+    human readable verdict (``stable`` / ``fragile`` / ``critical``). The
+    sweep honours a total wall-clock budget so a pathological corpus can
+    never hold an HTTP request open indefinitely.
+
+    Source is resolved and gated once up front (see
+    :func:`_prepare_execution_source`) so a scanned node with no bound text,
+    a node declaring a non-Python language, or Python source with a syntax
+    error stresses the safe fallback instead of crashing the sweep with
+    ``Node source is empty`` or ``SyntaxError``.
+    """
+    source, source_origin, resolved_language, warning, original_error = (
+        _prepare_execution_source(
+            code_str,
+            label=label,
+            file_path=file_path,
+            module=module,
+            fallback_code=fallback_code,
+            language=language,
+        )
+    )
+
+    corpus = list(edge_inputs if edge_inputs is not None else config.MUTATION_EDGE_INPUTS)
+    runs = max(1, min(int(iterations or 1), int(config.MUTATION_MAX_ITERATIONS)))
+    case_timeout = float(timeout or config.MUTATION_TIMEOUT_SECONDS)
+    total_budget = float(config.MUTATION_TOTAL_BUDGET_SECONDS)
+
+    cases: list[dict[str, Any]] = []
+    failure_index: dict[str, dict[str, Any]] = {}
+    stack_traces: list[dict[str, Any]] = []
+    seen_traces: set[str] = set()
+    failures = 0
+    truncated = False
+    total_started = time.perf_counter()
+    deadline = total_started + total_budget
+
+    for edge_input in corpus:
+        payload = mutation_payload(edge_input)
+        label = _edge_case_label(edge_input)
+        for run_number in range(1, runs + 1):
+            if time.perf_counter() >= deadline:
+                truncated = True
+                break
+
+            report = execute_node_code(source, payload, case_timeout)
+            input_repr = _safe_repr(edge_input)
+            case = {
+                "input": json_safe(edge_input),
+                "input_repr": input_repr,
+                "input_label": label,
+                "input_type": type(edge_input).__name__,
+                "run": run_number,
+                "status": report["status"],
+                "execution_time": report["execution_time"],
+                "stdout": (report.get("stdout") or "")[:800],
+                "return_repr": report.get("return_repr", "None"),
+                "error_type": None,
+                "error_message": None,
+                "stack_trace": None,
+            }
+
+            if report["status"] != "success":
+                failures += 1
+                error = report.get("error") or {}
+                case["error_type"] = error.get("type")
+                case["error_message"] = error.get("message")
+                case["stack_trace"] = error.get("traceback")
+
+                key = f"{error.get('type')}::{error.get('message')}"
+                bucket = failure_index.get(key)
+                if bucket is None:
+                    bucket = {
+                        "error_type": error.get("type"),
+                        "error_message": error.get("message"),
+                        "count": 0,
+                        "inputs": [],
+                        "stack_trace": error.get("traceback"),
+                    }
+                    failure_index[key] = bucket
+                bucket["count"] += 1
+                if input_repr not in bucket["inputs"]:
+                    bucket["inputs"].append(input_repr)
+
+                trace = error.get("traceback") or ""
+                if trace and trace not in seen_traces and len(stack_traces) < config.MUTATION_MAX_STACK_TRACES:
+                    seen_traces.add(trace)
+                    stack_traces.append(
+                        {
+                            "error_type": error.get("type"),
+                            "error_message": error.get("message"),
+                            "input_repr": input_repr,
+                            "stack_trace": trace,
+                        }
+                    )
+
+            cases.append(case)
+
+        if truncated:
+            break
+
+    total_runs = len(cases)
+    crash_rate = (failures / total_runs) if total_runs else 0.0
+    if failures == 0:
+        verdict = "stable"
+    elif crash_rate < 0.5:
+        verdict = "fragile"
+    else:
+        verdict = "critical"
+
+    return {
+        "total_runs": total_runs,
+        "passed": total_runs - failures,
+        "failed": failures,
+        "unhandled_exceptions": failures,
+        "crash_rate": round(crash_rate, 4),
+        "crash_frequency": f"{failures}/{total_runs}",
+        "verdict": verdict,
+        "iterations_per_input": runs,
+        "timeout_seconds": case_timeout,
+        "budget_seconds": total_budget,
+        "truncated": truncated,
+        "source_origin": source_origin,
+        "language": resolved_language,
+        "warning": warning,
+        "original_error": original_error,
+        "duration_ms": round((time.perf_counter() - total_started) * 1000, 3),
+        "edge_cases": [_edge_case_label(item) for item in corpus],
+        "cases": cases,
+        "failures": sorted(
+            failure_index.values(), key=lambda item: item["count"], reverse=True
+        ),
+        "stack_traces": stack_traces,
+    }
+
+
+# ----------------------------------------------------------------------
+# Service facade
+# ----------------------------------------------------------------------
+
+class SandboxExecutionService:
+    """Stateless domain service exposing sandbox execution primitives."""
+
+    def execute_node(
+        self,
+        code_str: Any,
+        input_payload: Any = None,
+        timeout: float | None = None,
+        *,
+        label: str | None = None,
+        file_path: str | None = None,
+        module: str | None = None,
+        fallback_code: str | None = None,
+        language: str | None = None,
+    ) -> dict[str, Any]:
+        """Execute one node's source and return the full run report.
+
+        Empty source degrades to a generated fallback snippet instead of an
+        error, so a scanned node with no bound text still executes. Nodes
+        declaring a non-Python language and Python source that fails to
+        compile are swapped for the safe stub rather than crashing the runner.
+        """
+        effective = timeout
+        if effective is not None and effective > SANDBOX_TIMEOUT_SECONDS:
+            effective = SANDBOX_TIMEOUT_SECONDS
+        return execute_node_code(
+            code_str,
+            input_payload,
+            timeout=effective,
+            label=label,
+            file_path=file_path,
+            module=module,
+            fallback_code=fallback_code,
+            language=language,
+        )
+
+    def run_mutation_test(
+        self,
+        code_str: Any,
+        iterations: int = 1,
+        timeout: float | None = None,
+        edge_inputs: list[Any] | None = None,
+        *,
+        label: str | None = None,
+        file_path: str | None = None,
+        module: str | None = None,
+        fallback_code: str | None = None,
+        language: str | None = None,
+    ) -> dict[str, Any]:
+        """Stress-test a node against the edge-case corpus."""
+        corpus = list(edge_inputs) if edge_inputs else None
+        return run_mutation_stress_test(
+            code_str,
+            iterations=iterations,
+            timeout=timeout,
+            edge_inputs=corpus,
+            label=label,
+            file_path=file_path,
+            module=module,
+            fallback_code=fallback_code,
+            language=language,
+        )
+
+    def describe(self) -> dict[str, Any]:
+        """Return the active isolation configuration."""
+        return describe_isolation()
+
+
+__all__ = [
+    "SandboxExecutionService",
+    "execute_node_code",
+    "run_mutation_stress_test",
+    "mutation_payload",
+    "build_safe_builtins",
+    "format_traceback",
+    "json_safe",
+    "describe_isolation",
+    "resolve_isolation_context",
+    "SandboxTimeoutError",
+    "SandboxBudgetExceeded",
+    "SandboxImportError",
+]

@@ -1,0 +1,39 @@
+# --- OS / editor -------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# --- Node / frontend ---------------------------------------------------------
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+frontend/coverage/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local env overrides (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# --- Python / backend --------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# --- Runtime state -----------------------------------------------------------
+*.db
+backend/logs/
+*.log

@@ -1,0 +1,26 @@
+{
+  "name": "axiomtrace",
+  "version": "1.1.0",
+  "private": true,
+  "description": "AxiomTrace - local-first interactive AST intelligence desktop studio (root orchestration scripts)",
+  "scripts": {
+    "dev": "concurrently -k -n backend,frontend -c yellow,cyan \"npm run backend\" \"npm run frontend\"",
+    "electron": "cd frontend && npm run electron:dev",
+    "electron:dev": "cd frontend && npm run electron:dev",
+    "dev:backend": "npm run backend",
+    "backend": "node scripts/backend.mjs",
+    "dev:frontend": "npm run frontend",
+    "frontend": "cd frontend && npm run dev",
+    "build": "cd frontend && npm run build",
+    "start": "cd frontend && npm run start",
+    "test": "cd backend && .venv/bin/python -m pytest -q",
+    "install:all": "cd frontend && npm install && cd ../backend && .venv/bin/pip install -r requirements.txt"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "electron-builder": "^26.18.0"
+  },
+  "engines": {
+    "node": ">=18.17.0"
+  }
+}
