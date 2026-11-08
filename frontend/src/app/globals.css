@@ -1,0 +1,299 @@
+@import "tailwindcss";
+@config "../../tailwind.config.js";
+
+/* ------------------------------------------------------------------ */
+/* Typography                                                          */
+/* ------------------------------------------------------------------ */
+/* `inline` keeps the utilities pointing straight at the next/font      */
+/* variables, so the locally hosted Inter / Plus Jakarta / JetBrains   */
+/* fonts are used without an extra CSS custom property indirection.    */
+
+@theme inline {
+  --font-sans:
+    var(--font-inter), "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-display:
+    var(--font-display), "Plus Jakarta Sans", var(--font-inter), "Inter",
+    sans-serif;
+  --font-mono:
+    var(--font-jetbrains-mono), "JetBrains Mono", "Fira Code", monospace;
+}
+
+/* ------------------------------------------------------------------ */
+/* Base canvas                                                         */
+/* ------------------------------------------------------------------ */
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background-color: #ffffff;
+  color: #0b0c0e;
+  font-family:
+    var(--font-inter), "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  letter-spacing: -0.011em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  letter-spacing: -0.03em;
+}
+
+::selection {
+  background: rgba(0, 122, 255, 0.18);
+  color: #0b0c0e;
+}
+
+:focus-visible {
+  outline: 2px solid rgba(0, 122, 255, 0.75);
+  outline-offset: 2px;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+/* ------------------------------------------------------------------ */
+/* Design-system utilities                                             */
+/* ------------------------------------------------------------------ */
+
+/* Ambient light canvas: two very soft neutral pools behind the shell. */
+.axiom-shell {
+  position: relative;
+  isolation: isolate;
+}
+
+.axiom-shell::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(60rem 32rem at 10% -8%, rgba(0, 122, 255, 0.045), transparent 62%),
+    radial-gradient(48rem 30rem at 92% 104%, rgba(48, 209, 88, 0.03), transparent 60%);
+}
+
+/* Light marketing surface - mirrors the Revolut landing palette. */
+.axiom-light {
+  background-color: #ffffff;
+  color: #0b0c0e;
+}
+
+.axiom-light .axiom-light-card {
+  background-color: #f4f5f7;
+  border: 1px solid transparent;
+  transition:
+    background-color 180ms ease,
+    border-color 180ms ease,
+    transform 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.axiom-light .axiom-light-card:hover {
+  background-color: #ffffff;
+  border-color: #e6e8ec;
+  box-shadow: 0 24px 60px rgba(11, 12, 14, 0.08);
+  transform: translateY(-2px);
+}
+
+.axiom-hairline {
+  box-shadow: inset 0 1px 0 rgba(11, 12, 14, 0.04);
+}
+
+.axiom-sheen {
+  position: relative;
+  overflow: hidden;
+}
+
+.axiom-sheen::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(
+    150deg,
+    rgba(11, 12, 14, 0.035) 0%,
+    rgba(11, 12, 14, 0) 56%
+  );
+}
+
+.axiom-numeric {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #d0d2d8 transparent;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #d0d2d8;
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #b8bbc3;
+}
+
+/* ------------------------------------------------------------------ */
+/* React Flow shell                                                    */
+/* ------------------------------------------------------------------ */
+
+.react-flow {
+  font-family: inherit;
+}
+
+.react-flow__attribution {
+  display: none;
+}
+
+.react-flow__pane.axiom-lasso,
+.axiom-lasso .react-flow__pane {
+  cursor: crosshair;
+}
+
+.react-flow__selection {
+  background: rgba(0, 122, 255, 0.08);
+  border: 1px dashed rgba(0, 122, 255, 0.7);
+  border-radius: 12px;
+}
+
+.react-flow__nodesselection-rect {
+  background: rgba(0, 122, 255, 0.06);
+  border: 1px dashed rgba(0, 122, 255, 0.7);
+  border-radius: 16px;
+}
+
+.react-flow__connection-line {
+  stroke: #007aff;
+  stroke-width: 2.2;
+}
+
+.react-flow__edge-path {
+  stroke: #d0d2d8;
+  stroke-width: 1.6;
+}
+
+.react-flow__edge:hover .react-flow__edge-path {
+  stroke: #9ba1ac;
+}
+
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke: #007aff;
+  filter: drop-shadow(0 0 4px rgba(0, 122, 255, 0.35));
+}
+
+.react-flow__edge-textbg {
+  fill: #ffffff;
+}
+
+.react-flow__edge-text {
+  fill: #5e6473;
+  font-size: 10px;
+  font-weight: 600;
+  font-family:
+    var(--font-jetbrains-mono), "JetBrains Mono", ui-monospace, monospace;
+}
+
+.react-flow__edge.selected .react-flow__edge-text {
+  fill: #0b0c0e;
+}
+
+/* Handles are sized and coloured through important utilities on the   */
+/* node component (React Flow ships its own unlayered handle rules).   */
+
+.react-flow__handle.axiom-handle,
+.axiom-handle.react-flow__handle {
+  width: 10px;
+  height: 10px;
+  background: #ffffff;
+  border: 2px solid #d0d2d8;
+  border-radius: 9999px;
+  transition:
+    background-color 0.15s ease-in-out,
+    transform 0.15s ease-in-out;
+}
+
+.react-flow__handle.axiom-handle:hover {
+  background: #007aff;
+  border-color: #007aff;
+  transform: scale(1.25);
+}
+
+/* ------------------------------------------------------------------ */
+/* Controls + minimap chrome                                           */
+/* ------------------------------------------------------------------ */
+
+.react-flow__controls {
+  box-shadow: 0 10px 32px rgba(11, 12, 14, 0.08), inset 0 1px 0 #ffffff;
+  border: 1px solid #e3e5e9;
+  border-radius: 18px;
+  overflow: hidden;
+  margin: 20px;
+  background: rgba(255, 255, 255, 0.94);
+  backdrop-filter: blur(20px);
+}
+
+.react-flow__controls-button {
+  width: 36px;
+  height: 36px;
+  background: transparent;
+  border-bottom: 1px solid #e3e5e9;
+  fill: #5e6473;
+  color: #5e6473;
+  transition:
+    background-color 0.15s ease-in-out,
+    fill 0.15s ease-in-out;
+}
+
+.react-flow__controls-button:hover {
+  background: #f4f5f7;
+  fill: #0b0c0e;
+  color: #0b0c0e;
+}
+
+.react-flow__controls-button:last-child {
+  border-bottom: none;
+}
+
+.react-flow__minimap {
+  border: 1px solid #e3e5e9;
+  border-radius: 18px;
+  overflow: hidden;
+  margin: 20px;
+  box-shadow: 0 10px 32px rgba(11, 12, 14, 0.08);
+  backdrop-filter: blur(20px);
+}
+
+.react-flow__minimap-mask {
+  fill: rgba(255, 255, 255, 0.88);
+}
+
+.react-flow__node {
+  transition: transform 220ms ease;
+}
+
+.react-flow__node.draggable.dragging {
+  transition: none;
+}
